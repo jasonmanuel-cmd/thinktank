@@ -112,8 +112,8 @@ main.thread-wrap { grid-column: 2; grid-row: 2; overflow-y: auto; padding: 20px;
 .input-row textarea { flex: 1; min-height: 56px; max-height: 220px; font-size: 1rem; padding: 12px; background: var(--bg-elev); }
 .input-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .status-line { font-size: 0.82rem; color: var(--text-muted); min-height: 1.2em; }
-.status-line .err { color: var(--danger); }
-.status-line .warn { color: var(--warn); }
+.status-line.err { color: var(--danger); }
+.status-line.warn { color: var(--warn); }
 
 /* Seats panel */
 .seat-card { background: var(--bg-elev-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
@@ -178,9 +178,16 @@ select, input[type="number"], input[type="text"], input[type="password"] { backg
 .visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,1px,1px); white-space: nowrap; border: 0; }
 </style>
 <script>
-  window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+  // Vercel's analytics endpoint exists on Vercel-hosted domains only. Avoid making
+  // a failing request (or sending telemetry) when this standalone app is self-hosted.
+  if (location.hostname.endsWith('.vercel.app')) {
+    window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+    const analyticsScript = document.createElement('script');
+    analyticsScript.defer = true;
+    analyticsScript.src = '/_vercel/insights/script.js';
+    document.head.appendChild(analyticsScript);
+  }
 </script>
-<script defer src="/_vercel/insights/script.js"></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -236,7 +243,7 @@ select, input[type="number"], input[type="text"], input[type="password"] { backg
         <div class="section-header"><span>Seats</span></div>
         <div id="seatsList"></div>
         <div class="row wrap" style="margin-top:8px;">
-          <button id="btnAddSeat">Add seat</button>
+          <button id="btnAddSeat">Add seat (max 5)</button>
           <button id="btnResetSeats">Reset presets</button>
         </div>
       </div>
@@ -351,7 +358,7 @@ select, input[type="number"], input[type="text"], input[type="password"] { backg
           </div>
           <div class="field full">
             <div class="inline-status" id="ollamaStatus"></div>
-            <div class="help warn">Ollama needs <span class="kbd">OLLAMA_ORIGINS</span> set to allow browser calls (for example <span class="kbd">OLLAMA_ORIGINS="*" ollama serve</span>, or restrict to your host).</div>
+            <div class="help warn">Set <span class="kbd">OLLAMA_ORIGINS</span> to the exact origin serving this app (for the README server, <span class="kbd">http://localhost:8080</span>). Avoid <span class="kbd">*</span>: it may let any website opened in your browser access your local Ollama endpoint.</div>
           </div>
         </div>
       </div>
@@ -389,7 +396,7 @@ select, input[type="number"], input[type="text"], input[type="password"] { backg
             <label class="toggle" style="margin-top:26px;"><input type="checkbox" id="capEnabled" checked> Pause and ask before going over cap</label>
           </div>
           <div class="field full">
-            <div class="help">OpenRouter pricing comes from the live models endpoint. Free models show $0. Direct/local providers without pricing data show $0 estimate.</div>
+            <div class="help">OpenRouter pricing comes from the live models endpoint. Models without pricing/usage data are shown as unknown, not free. The cap checks a conservative prompt/output estimate before each request, but tokenization and provider billing can differ.</div>
           </div>
         </div>
       </div>
@@ -408,9 +415,13 @@ const STORAGE_KEYS = {
   settings: 'coai_settings_v1',
   keys: 'coai_keys_v1'
 };
+const MAX_SEATS = 5;
+const DEFAULT_CONTEXT_TOKENS = 8192;
+const MAX_OUTPUT_TOKENS = 1024;
 
 const Storage = {
   available: true,
+  lastWriteFailed: false,
   _test() {
     try {
       const k = '__coai_test__';
@@ -433,11 +444,13 @@ const Storage = {
     }
   },
   set(key, value) {
-    if (!this.available) return false;
+    if (!this.available) { this.lastWriteFailed = true; return false; }
     try {
       localStorage.setItem(key, JSON.stringify(value));
+      this.lastWriteFailed = false;
       return true;
     } catch (e) {
+      this.lastWriteFailed = true;
       console.warn('Storage write failed', e);
       return false;
     }
@@ -586,13 +599,41 @@ function getModelInfo(providerId, modelId) {
 }
 
 function estimateCost(providerId, modelId, promptTokens, completionTokens) {
-  if (providerId !== 'openrouter') return 0;
   const info = getModelInfo(providerId, modelId);
-  if (!info || !info.pricing) return 0;
-  const p = Number(info.pricing.prompt) || 0;
-  const c = Number(info.pricing.completion) || 0;
-  // OpenRouter pricing is per token (USD/token).
-  return (promptTokens * p) + (completionTokens * c);
+  if (!info?.pricing) return null;
+  const promptPrice = Number(info.pricing.prompt);
+  const completionPrice = Number(info.pricing.completion);
+  const promptCount = Number(promptTokens);
+  const completionCount = Number(completionTokens);
+  if (![promptPrice, completionPrice, promptCount, completionCount].every(Number.isFinite)
+    || promptPrice < 0 || completionPrice < 0 || promptCount < 0 || completionCount < 0) return null;
+  // OpenRouter pricing is per token (USD/token). Unknown pricing stays unknown, not $0.
+  const cost = (promptCount * promptPrice) + (completionCount * completionPrice);
+  return Number.isFinite(cost) && cost >= 0 ? cost : null;
+}
+
+function estimateRequestCost(providerId, modelId, messages, maxTokens = MAX_OUTPUT_TOKENS) {
+  const info = getModelInfo(providerId, modelId);
+  if (!info?.pricing) return null;
+  const promptPrice = Number(info.pricing.prompt);
+  const completionPrice = Number(info.pricing.completion);
+  const outputBudget = Number(maxTokens);
+  if (![promptPrice, completionPrice, outputBudget].every(Number.isFinite)
+    || promptPrice < 0 || completionPrice < 0 || outputBudget < 0) return null;
+  const promptTokens = estimateMessagesTokens(messages);
+  // Character-based token estimates vary by language/model. Apply a margin and reserve
+  // the configured maximum completion budget so the cap check is conservative.
+  const estimate = (promptTokens * 1.25 * promptPrice) + (outputBudget * completionPrice);
+  return Number.isFinite(estimate) && estimate >= 0 ? estimate : null;
+}
+
+function getModelContextLimit(providerId, modelId) {
+  const reported = Number(getModelInfo(providerId, modelId)?.context_length);
+  return Number.isFinite(reported) && reported > 0 ? reported : DEFAULT_CONTEXT_TOKENS;
+}
+
+function getOutputTokenLimit(providerId, modelId) {
+  return Math.max(1, Math.min(MAX_OUTPUT_TOKENS, Math.floor(getModelContextLimit(providerId, modelId) * 0.15)));
 }
 
 async function safeReadText(res) {
@@ -644,14 +685,15 @@ async function* sseLines(stream) {
       yield line;
     }
   }
+  buffer += decoder.decode();
   if (buffer) yield buffer.replace(/\r$/, '');
 }
 
-async function streamOpenAICompatible({ url, apiKey, model, messages, temperature, signal, extraHeaders = {}, onToken, onUsage }) {
+async function streamOpenAICompatible({ url, apiKey, model, messages, temperature, maxTokens = MAX_OUTPUT_TOKENS, signal, extraHeaders = {}, onToken, onUsage }) {
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
   Object.assign(headers, extraHeaders);
-  const body = { model, messages, temperature, stream: true };
+  const body = { model, messages, temperature, max_tokens: maxTokens, stream: true };
   if (url.includes('openrouter.ai')) body.stream_options = { include_usage: true };
   let res;
   try {
@@ -682,7 +724,7 @@ async function streamOpenAICompatible({ url, apiKey, model, messages, temperatur
     const errMsg = obj.error?.message || obj.error;
     if (errMsg) throw new Error(typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg));
   }
-  if (usage && onUsage) onUsage({ prompt: usage.prompt_tokens || 0, completion: usage.completion_tokens || 0 });
+  if (usage && onUsage) onUsage({ prompt: usage.prompt_tokens, completion: usage.completion_tokens });
 }
 
 function formatApiErrorByUrl(url, err) {
@@ -693,7 +735,7 @@ function formatApiErrorByUrl(url, err) {
   return formatApiError('ollama', err);
 }
 
-async function streamAnthropic({ apiKey, model, messages, temperature, signal, onToken, onUsage }) {
+async function streamAnthropic({ apiKey, model, messages, temperature, maxTokens = MAX_OUTPUT_TOKENS, signal, onToken, onUsage }) {
   // Convert OpenAI-style messages to Anthropic format. System messages merged.
   let system = '';
   const conv = [];
@@ -708,7 +750,7 @@ async function streamAnthropic({ apiKey, model, messages, temperature, signal, o
     else merged.push({ ...m });
   }
   if (!merged.length) merged.push({ role: 'user', content: 'Hello' });
-  const body = { model, max_tokens: 1024, temperature, stream: true, messages: merged };
+  const body = { model, max_tokens: maxTokens, temperature, stream: true, messages: merged };
   if (system) body.system = system;
   let res;
   try {
@@ -730,7 +772,7 @@ async function streamAnthropic({ apiKey, model, messages, temperature, signal, o
     const err = new Error(formatApiError('anthropic', null, res.status, text));
     err.status = res.status; err.bodyText = text; throw err;
   }
-  let inputTokens = 0, outputTokens = 0;
+  let inputTokens = null, outputTokens = null;
   for await (const line of sseLines(res.body)) {
     if (line.startsWith('event:')) continue;
     if (!line.startsWith('data:')) continue;
@@ -738,15 +780,21 @@ async function streamAnthropic({ apiKey, model, messages, temperature, signal, o
     if (!data) continue;
     let obj;
     try { obj = JSON.parse(data); } catch { continue; }
-    if (obj.type === 'message_start' && obj.message?.usage) inputTokens = obj.message.usage.input_tokens || 0;
-    if (obj.type === 'message_delta' && obj.usage) outputTokens = obj.usage.output_tokens || outputTokens;
+    if (obj.type === 'message_start' && obj.message?.usage && 'input_tokens' in obj.message.usage) {
+      inputTokens = obj.message.usage.input_tokens;
+    }
+    if (obj.type === 'message_delta' && obj.usage && 'output_tokens' in obj.usage) {
+      outputTokens = obj.usage.output_tokens;
+    }
     if (obj.type === 'content_block_delta' && obj.delta?.type === 'text_delta') onToken(obj.delta.text || '');
     if (obj.type === 'error') throw new Error(obj.error?.message || 'Anthropic stream error');
   }
-  if (onUsage) onUsage({ prompt: inputTokens, completion: outputTokens });
+  if (onUsage && (inputTokens !== null || outputTokens !== null)) {
+    onUsage({ prompt: inputTokens, completion: outputTokens });
+  }
 }
 
-async function streamGoogle({ apiKey, model, messages, temperature, signal, onToken, onUsage }) {
+async function streamGoogle({ apiKey, model, messages, temperature, maxTokens = MAX_OUTPUT_TOKENS, signal, onToken, onUsage }) {
   // Convert to Gemini format. System instruction separate.
   let system = '';
   const contents = [];
@@ -764,7 +812,7 @@ async function streamGoogle({ apiKey, model, messages, temperature, signal, onTo
   if (!merged.length) merged.push({ role: 'user', parts: [{ text: 'Hello' }] });
   const body = {
     contents: merged,
-    generationConfig: { temperature, maxOutputTokens: 1024 }
+    generationConfig: { temperature, maxOutputTokens: maxTokens }
   };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
@@ -783,7 +831,7 @@ async function streamGoogle({ apiKey, model, messages, temperature, signal, onTo
     const err = new Error(formatApiError('google', null, res.status, text));
     err.status = res.status; err.bodyText = text; throw err;
   }
-  let promptTokens = 0, completionTokens = 0;
+  let promptTokens = null, completionTokens = null;
   for await (const line of sseLines(res.body)) {
     if (!line.startsWith('data:')) continue;
     const data = line.slice(5).trim();
@@ -793,38 +841,40 @@ async function streamGoogle({ apiKey, model, messages, temperature, signal, onTo
     const parts = obj.candidates?.[0]?.content?.parts || [];
     for (const p of parts) if (p.text) onToken(p.text);
     if (obj.usageMetadata) {
-      promptTokens = obj.usageMetadata.promptTokenCount || promptTokens;
-      completionTokens = obj.usageMetadata.candidatesTokenCount || completionTokens;
+      if ('promptTokenCount' in obj.usageMetadata) promptTokens = obj.usageMetadata.promptTokenCount;
+      if ('candidatesTokenCount' in obj.usageMetadata) completionTokens = obj.usageMetadata.candidatesTokenCount;
     }
     if (obj.error) throw new Error(obj.error.message || JSON.stringify(obj.error));
   }
-  if (onUsage) onUsage({ prompt: promptTokens, completion: completionTokens });
+  if (onUsage && (promptTokens !== null || completionTokens !== null)) {
+    onUsage({ prompt: promptTokens, completion: completionTokens });
+  }
 }
 
-async function streamProvider({ providerId, model, messages, temperature, signal, onToken, onUsage }) {
+async function streamProvider({ providerId, model, messages, temperature, maxTokens = MAX_OUTPUT_TOKENS, signal, onToken, onUsage }) {
   const key = ProviderState.keys[providerId] || '';
   if (providerId === 'openrouter') {
     if (!key) throw Object.assign(new Error('OpenRouter API key is missing. Add it in Settings.'), { status: 401 });
-    return streamOpenAICompatible({ url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: key, model, messages, temperature, signal,
+    return streamOpenAICompatible({ url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: key, model, messages, temperature, maxTokens, signal,
       extraHeaders: { 'HTTP-Referer': location.origin === 'null' ? 'http://localhost' : location.origin, 'X-Title': 'COAI Think Tank' },
       onToken, onUsage });
   }
   if (providerId === 'ollama') {
     const base = normalizeBaseUrl(ProviderState.ollamaBaseUrl);
     if (!base) throw new Error('Ollama/compatible base URL is missing. Add it in Settings.');
-    return streamOpenAICompatible({ url: openAIChatUrl(base), apiKey: key, model, messages, temperature, signal, onToken, onUsage });
+    return streamOpenAICompatible({ url: openAIChatUrl(base), apiKey: key, model, messages, temperature, maxTokens, signal, onToken, onUsage });
   }
   if (providerId === 'openai') {
     if (!key) throw Object.assign(new Error('OpenAI API key is missing. Add it in Settings.'), { status: 401 });
-    return streamOpenAICompatible({ url: 'https://api.openai.com/v1/chat/completions', apiKey: key, model, messages, temperature, signal, onToken, onUsage });
+    return streamOpenAICompatible({ url: 'https://api.openai.com/v1/chat/completions', apiKey: key, model, messages, temperature, maxTokens, signal, onToken, onUsage });
   }
   if (providerId === 'anthropic') {
     if (!key) throw Object.assign(new Error('Anthropic API key is missing. Add it in Settings.'), { status: 401 });
-    return streamAnthropic({ apiKey: key, model, messages, temperature, signal, onToken, onUsage });
+    return streamAnthropic({ apiKey: key, model, messages, temperature, maxTokens, signal, onToken, onUsage });
   }
   if (providerId === 'google') {
     if (!key) throw Object.assign(new Error('Google AI API key is missing. Add it in Settings.'), { status: 401 });
-    return streamGoogle({ apiKey: key, model, messages, temperature, signal, onToken, onUsage });
+    return streamGoogle({ apiKey: key, model, messages, temperature, maxTokens, signal, onToken, onUsage });
   }
   throw new Error(`Unknown provider: ${providerId}`);
 }
@@ -856,6 +906,7 @@ function uid() { return 'id_' + Math.random().toString(36).slice(2, 10) + Date.n
 function cloneSeats(seats) { return JSON.parse(JSON.stringify(seats)).map(s => ({ ...s, id: s.id || uid() })); }
 
 function makeSeat(overrides = {}) {
+  if (App.seats.length >= MAX_SEATS) throw new Error(`A lineup can have at most ${MAX_SEATS} seats.`);
   const palette = ['#6ea8fe','#8bd3a8','#ff7b72','#f2cc60','#d2a8ff','#ffa657','#79c0ff','#a5d6ff'];
   const n = App.seats.length + 1;
   return {
@@ -877,8 +928,11 @@ function activeSeats() { return App.seats.filter(s => s.enabled); }
 function activeDiscussionSeats() { return App.seats.filter(s => s.enabled && !isModeratorSeat(s)); }
 function isModeratorSeat(seat) { return /moderator/i.test(seat.name); }
 
-function seatPresetsStore() { return Storage.get(STORAGE_KEYS.presets, {}); }
-function saveSeatPresetsStore(store) { Storage.set(STORAGE_KEYS.presets, store); }
+function seatPresetsStore() {
+  const store = Storage.get(STORAGE_KEYS.presets, {});
+  return store && typeof store === 'object' && !Array.isArray(store) ? store : {};
+}
+function saveSeatPresetsStore(store) { return Storage.set(STORAGE_KEYS.presets, store); }
 
 function exportSeatLineup() {
   return App.seats.map(s => ({
@@ -887,18 +941,30 @@ function exportSeatLineup() {
   }));
 }
 
+function normalizeSeatLineup(lineup) {
+  if (!Array.isArray(lineup) || lineup.length < 2) throw new Error('A lineup must have at least 2 seats.');
+  if (lineup.length > MAX_SEATS) throw new Error(`A lineup can have at most ${MAX_SEATS} seats.`);
+  return lineup.map((s, i) => {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) throw new Error(`Seat ${i + 1} is invalid.`);
+    const temperature = Number(s.temperature ?? 0.7);
+    const provider = typeof s.provider === 'string' && Object.prototype.hasOwnProperty.call(PROVIDERS, s.provider)
+      ? s.provider
+      : 'openrouter';
+    return {
+      id: uid(),
+      name: String(s.name || `Seat ${i+1}`).slice(0, 60),
+      color: /^#[0-9a-fA-F]{6}$/.test(String(s.color || '')) ? s.color : '#6ea8fe',
+      provider,
+      model: typeof s.model === 'string' ? s.model.slice(0, 200) : '',
+      enabled: s.enabled !== false,
+      temperature: Number.isFinite(temperature) ? clamp(temperature, 0, 2) : 0.7,
+      role: String(s.role || '').slice(0, 4000)
+    };
+  });
+}
+
 function importSeatLineup(lineup) {
-  if (!Array.isArray(lineup) || !lineup.length) throw new Error('Preset must be a non-empty array of seats.');
-  App.seats = lineup.map((s, i) => ({
-    id: uid(),
-    name: String(s.name || `Seat ${i+1}`).slice(0, 60),
-    color: /^#[0-9a-fA-F]{6}$/.test(s.color) ? s.color : '#6ea8fe',
-    provider: PROVIDERS[s.provider] ? s.provider : 'openrouter',
-    model: typeof s.model === 'string' ? s.model : '',
-    enabled: s.enabled !== false,
-    temperature: clamp(Number(s.temperature ?? 0.7), 0, 2),
-    role: String(s.role || '').slice(0, 4000)
-  }));
+  App.seats = normalizeSeatLineup(lineup);
   renderSeats();
   persistSettings();
 }
@@ -910,6 +976,7 @@ const App = {
   seats: cloneSeats(DEFAULT_SEATS),
   messages: [], // {id, role:'user'|'seat'|'system', speaker, seatId, color, content, ts, usage, cost, error, rateLimited}
   running: false,
+  runInFlight: false,
   abortController: null,
   skipRequested: false,
   currentSeatId: null,
@@ -922,9 +989,10 @@ const App = {
   summarizedMessageCount: 0,
   spendingCap: 1.00,
   capEnabled: true,
-  capApprovedOverage: false,
   sessionCost: 0,
+  sessionCostKnown: true,
   sessionTokens: { prompt: 0, completion: 0 },
+  contextTruncated: false,
   lastUserMessageId: null
 };
 
@@ -938,126 +1006,234 @@ function buildSharedRule(seat) {
   return `You are ${seat.name} in a think-tank discussion with ${otherList} and the user. Respond to the latest points, agree or push back by name, stay under 200 words unless asked, and add something new instead of repeating.`;
 }
 
-function buildConversationMessagesForSeat(seat) {
-  const msgs = [];
-  const system = `${seat.role}\n\n${buildSharedRule(seat)}`;
-  msgs.push({ role: 'system', content: system });
-  if (App.runningBrief) {
-    msgs.push({ role: 'system', content: `Running brief of earlier conversation (for context):\n${App.runningBrief}` });
-  }
-  // Keep last 10 messages in full (displayable conversation messages)
-  const display = getThreadForDisplay();
-  const tail = display.slice(-10);
-  for (const m of tail) {
-    if (m.role === 'user') {
-      msgs.push({ role: 'user', content: `[User]: ${m.content}` });
-    } else if (m.role === 'seat') {
-      // Model sees other seats as assistant turns? Better to present as user-labeled transcript
-      // to avoid confusing multi-speaker assistant messages. We'll use user role with speaker labels,
-      // and put the current seat's own prior messages as assistant.
-      if (m.seatId === seat.id) {
-        msgs.push({ role: 'assistant', content: m.content });
-      } else {
-        msgs.push({ role: 'user', content: `[${m.speaker}]: ${m.content}` });
-      }
-    }
-  }
-  // Ensure last message is from user (API requirement for some providers)
-  if (!msgs.length || msgs[msgs.length - 1].role !== 'user') {
-    msgs.push({ role: 'user', content: '[System]: Continue the discussion with your response.' });
-  }
-  // Merge adjacent same-role messages for provider compatibility
+function mergeAdjacentMessages(messages) {
   const merged = [];
-  for (const m of msgs) {
-    if (merged.length && merged[merged.length-1].role === m.role) {
-      merged[merged.length-1].content += '\n\n' + m.content;
-    } else merged.push({ ...m });
+  for (const message of messages) {
+    if (merged.length && merged[merged.length - 1].role === message.role) {
+      merged[merged.length - 1].content += '\n\n' + message.content;
+    } else {
+      merged.push({ ...message });
+    }
   }
   return merged;
 }
 
-function estimateTokensRough(text) { return Math.ceil((text || '').length / 4); }
+function estimateTokensRough(text) {
+  // Intentionally conservative; actual tokenizer counts vary by provider and language.
+  return Math.ceil(String(text || '').length / 3);
+}
+
+function estimateMessagesTokens(messages) {
+  return messages.reduce((total, message) => total + estimateTokensRough(message.content) + 8, 0);
+}
+
+function truncateTextToTokenBudget(text, tokenBudget) {
+  const value = String(text || '');
+  const maxChars = Math.max(0, Math.floor(tokenBudget) * 3);
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 80) return value.slice(0, maxChars);
+  const headChars = Math.floor(maxChars * 0.4);
+  const tailChars = maxChars - headChars;
+  return `${value.slice(0, headChars)}\n[Middle omitted to fit model context]\n${value.slice(-tailChars)}`;
+}
+
+function buildConversationMessagesForSeat(seat, maxTokens = getOutputTokenLimit(seat.provider, seat.model)) {
+  const contextLimit = getModelContextLimit(seat.provider, seat.model);
+  const safetyMargin = Math.min(512, Math.floor(contextLimit * 0.05));
+  const inputBudget = Math.max(1, contextLimit - maxTokens - safetyMargin);
+  const prefix = [{ role: 'system', content: `${seat.role}\n\n${buildSharedRule(seat)}` }];
+  if (App.runningBrief) {
+    prefix.push({ role: 'system', content: `Running brief of earlier conversation (for context):\n${App.runningBrief}` });
+  }
+
+  // Build from the entire visible history, then remove the oldest turns only when the
+  // selected model's context budget requires it. Keep the latest user message whenever possible.
+  const history = getThreadForDisplay()
+    .filter(m => (m.role === 'user' || m.role === 'seat') && !m.streaming)
+    .map(m => ({
+      sourceRole: m.role,
+      role: m.role === 'user' ? 'user' : (m.seatId === seat.id ? 'assistant' : 'user'),
+      content: m.role === 'user' ? `[User]: ${m.content}` : (m.seatId === seat.id ? m.content : `[${m.speaker || 'Seat'}]: ${m.content}`)
+    }));
+  const latestUserMessage = [...history].reverse().find(m => m.sourceRole === 'user') || null;
+  const protectedMessage = latestUserMessage || history[history.length - 1] || null;
+  let truncated = false;
+  const compose = () => {
+    const transcript = history.map(({ role, content }) => ({ role, content }));
+    if (!transcript.length || transcript[transcript.length - 1].role !== 'user') {
+      transcript.push({ role: 'user', content: '[System]: Continue the discussion with your response.' });
+    }
+    return mergeAdjacentMessages([...prefix, ...transcript]);
+  };
+
+  let messages = compose();
+  while (estimateMessagesTokens(messages) > inputBudget && history.length > 1) {
+    const removeIndex = history.findIndex(message => message !== protectedMessage);
+    if (removeIndex < 0) break;
+    history.splice(removeIndex, 1);
+    truncated = true;
+    messages = compose();
+  }
+
+  if (estimateMessagesTokens(messages) > inputBudget && protectedMessage && history.includes(protectedMessage)) {
+    const totalTokens = estimateMessagesTokens(messages);
+    const protectedTokens = estimateTokensRough(protectedMessage.content);
+    const availableTokens = Math.max(0, inputBudget - (totalTokens - protectedTokens) - 16);
+    protectedMessage.content = `[Message shortened to fit model context]\n${truncateTextToTokenBudget(protectedMessage.content, availableTokens)}`;
+    truncated = true;
+    messages = compose();
+  }
+
+  // If role instructions or the running brief alone exceed a small model's budget, trim
+  // those prompt prefixes as a last resort rather than sending a predictably invalid request.
+  for (let i = prefix.length - 1; i >= 0 && estimateMessagesTokens(messages) > inputBudget; i--) {
+    const excess = estimateMessagesTokens(messages) - inputBudget;
+    const oldTokens = estimateTokensRough(prefix[i].content);
+    prefix[i].content = truncateTextToTokenBudget(prefix[i].content, Math.max(0, oldTokens - excess - 16));
+    truncated = true;
+    messages = compose();
+  }
+  App.contextTruncated = App.contextTruncated || truncated;
+  return { messages, truncated, inputBudget };
+}
 
 async function maybeSummarizeContext() {
   const display = getThreadForDisplay();
-  // Summarize when thread is long: keep last 10 messages in full, summarize older into running brief.
-  if (display.length <= 14) return;
+  // Summarize older messages once enough history has accumulated. Prompt construction
+  // independently fits the remaining transcript to each model's reported context window.
+  if (display.length <= 14) return true;
   const keepTail = 10;
   const cutoff = display.length - keepTail;
-  if (cutoff <= App.summarizedMessageCount) return; // already summarized up to this point
+  if (cutoff <= App.summarizedMessageCount) return true;
   const toSummarize = display.slice(App.summarizedMessageCount, cutoff);
-  if (!toSummarize.length) return;
+  if (!toSummarize.length) return true;
   const transcript = toSummarize.map(m => `[${m.speaker || 'User'}]: ${m.content}`).join('\n\n');
   const briefPrompt = `Summarize this earlier think-tank discussion into a compact running brief. Preserve key claims, disagreements, decisions, numbers, and open questions. Be factual and concise.\n\n${App.runningBrief ? 'Previous brief:\n' + App.runningBrief + '\n\n' : ''}Transcript:\n${transcript}`;
   const summarizer = pickCheapestModel();
-  if (!summarizer) return; // can't summarize, keep as is
+  if (!summarizer) return true;
+
+  const maxTokens = getOutputTokenLimit(summarizer.provider, summarizer.model);
+  const contextLimit = getModelContextLimit(summarizer.provider, summarizer.model);
+  const summaryBudget = Math.max(1, contextLimit - maxTokens - Math.min(512, Math.floor(contextLimit * 0.05)));
+  const summaryMessages = [
+    { role: 'system', content: 'You write concise factual summaries.' },
+    { role: 'user', content: truncateTextToTokenBudget(briefPrompt, summaryBudget - 32) }
+  ];
+  const estimate = estimateRequestCost(summarizer.provider, summarizer.model, summaryMessages, maxTokens);
+  if (!checkSpendingCap(estimate, 'context summary')) {
+    setStatus('Paused: spending cap reached; context summary was not sent.', 'warn');
+    return false;
+  }
+
+  let summary = '';
+  let summaryPromptTokens = null;
+  let summaryCompletionTokens = null;
+  const controller = new AbortController();
+  App.abortController = controller;
+  updateControls();
+  const timer = setTimeout(() => controller.abort(), 45000);
   try {
-    let summary = '';
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 45000);
     await streamProvider({
-      providerId: summarizer.provider, model: summarizer.model, temperature: 0.2, signal: ctrl.signal,
-      messages: [{ role: 'system', content: 'You write concise factual summaries.' }, { role: 'user', content: briefPrompt }],
-      onToken: t => { summary += t; },
-      onUsage: u => { trackUsage(summarizer.provider, summarizer.model, u.prompt, u.completion, 'summary'); }
+      providerId: summarizer.provider, model: summarizer.model, temperature: 0.2, maxTokens,
+      signal: controller.signal, messages: summaryMessages,
+      onToken: token => { summary += token; },
+      onUsage: usage => {
+        summaryPromptTokens = usage.prompt;
+        summaryCompletionTokens = usage.completion;
+      }
     });
-    clearTimeout(timer);
+    const summaryUsageComplete = isValidUsageCount(summaryPromptTokens) && isValidUsageCount(summaryCompletionTokens);
+    if (!summaryUsageComplete) App.sessionCostKnown = false;
+    const promptCount = isValidUsageCount(summaryPromptTokens)
+      ? Number(summaryPromptTokens)
+      : estimateMessagesTokens(summaryMessages);
+    const completionCount = isValidUsageCount(summaryCompletionTokens)
+      ? Number(summaryCompletionTokens)
+      : estimateTokensRough(summary);
+    trackUsage(summarizer.provider, summarizer.model, promptCount, completionCount, 'summary');
     if (summary.trim()) {
       App.runningBrief = summary.trim().slice(0, 4000);
       App.summarizedMessageCount = cutoff;
-      // Keep full thread in App.messages for UI/export; buildConversationMessagesForSeat uses brief + last 10.
       setStatus('Context summarized into running brief.');
       updateStats();
     }
-  } catch (e) {
-    console.warn('Context summarization failed', e);
+  } catch (error) {
+    const status = Number(error?.status) || 0;
+    if (summary || controller.signal.aborted || !status || status >= 500) App.sessionCostKnown = false;
+    updateStats();
+    console.warn('Context summarization failed', error);
+  } finally {
+    clearTimeout(timer);
+    if (App.abortController === controller) App.abortController = null;
+    updateControls();
   }
+  return true;
 }
 
 function pickCheapestModel() {
-  // From active/enabled seats with configured provider+model; prefer free/openrouter low cost
+  // Prefer known low-cost OpenRouter models. Unknown provider pricing is never treated as free.
   const candidates = [];
-  for (const s of App.seats) {
-    if (!s.enabled || !s.model) continue;
-    const info = getModelInfo(s.provider, s.model);
-    let costPer1k = Infinity;
-    if (s.provider === 'openrouter' && info?.pricing) {
-      costPer1k = (Number(info.pricing.prompt)||0) + (Number(info.pricing.completion)||0);
-    } else if (s.provider === 'ollama') {
-      costPer1k = 0;
-    } else {
-      costPer1k = 999; // unknown direct cost
-    }
-    candidates.push({ provider: s.provider, model: s.model, costPer1k });
+  for (const seat of App.seats) {
+    if (!seat.enabled || !seat.model) continue;
+    const info = getModelInfo(seat.provider, seat.model);
+    const promptPrice = Number(info?.pricing?.prompt);
+    const completionPrice = Number(info?.pricing?.completion);
+    const costPer1k = Number.isFinite(promptPrice) && Number.isFinite(completionPrice)
+      && promptPrice >= 0 && completionPrice >= 0
+      ? promptPrice + completionPrice
+      : Infinity;
+    candidates.push({ provider: seat.provider, model: seat.model, costPer1k });
   }
-  candidates.sort((a,b) => a.costPer1k - b.costPer1k);
+  candidates.sort((a, b) => a.costPer1k - b.costPer1k);
   return candidates[0] || null;
 }
 
+function isValidUsageCount(value) {
+  return value !== null && value !== undefined && value !== ''
+    && Number.isFinite(Number(value)) && Number(value) >= 0;
+}
+
+function normalizeUsageCount(value) {
+  const count = Number(value);
+  return Number.isFinite(count) && count >= 0 ? count : 0;
+}
+
 function trackUsage(providerId, modelId, promptTokens, completionTokens, label) {
-  const cost = estimateCost(providerId, modelId, promptTokens, completionTokens);
-  App.sessionTokens.prompt += promptTokens || 0;
-  App.sessionTokens.completion += completionTokens || 0;
-  App.sessionCost += cost;
+  const promptCount = normalizeUsageCount(promptTokens);
+  const completionCount = normalizeUsageCount(completionTokens);
+  const cost = estimateCost(providerId, modelId, promptCount, completionCount);
+  App.sessionTokens.prompt += promptCount;
+  App.sessionTokens.completion += completionCount;
+  if (cost === null) App.sessionCostKnown = false;
+  else App.sessionCost += cost;
   updateStats();
   return cost;
 }
 
-function checkSpendingCap(additionalEstimate = 0) {
+function checkSpendingCap(additionalEstimate, requestLabel = 'model request') {
   if (!App.capEnabled) return true;
   const cap = Number(App.spendingCap);
-  if (!(cap > 0)) return true;
-  if (App.sessionCost + additionalEstimate <= cap) return true;
-  if (App.capApprovedOverage) return true;
-  const ok = confirm(`Session spending cap ($${cap.toFixed(2)}) would be exceeded (current $${App.sessionCost.toFixed(4)}). Continue anyway?`);
-  if (ok) { App.capApprovedOverage = true; return true; }
-  return false;
+  if (cap === 0) return true; // A zero cap disables the cap.
+  if (!Number.isFinite(cap) || cap < 0) {
+    return confirm(`The configured spending cap is invalid (${String(App.spendingCap)}). Continue with this ${requestLabel} anyway?`);
+  }
+  const estimateKnown = Number.isFinite(additionalEstimate) && additionalEstimate >= 0;
+  const sessionCostKnown = App.sessionCostKnown && Number.isFinite(App.sessionCost) && App.sessionCost >= 0;
+  if (sessionCostKnown && estimateKnown && App.sessionCost + additionalEstimate <= cap) return true;
+
+  const current = sessionCostKnown
+    ? `$${App.sessionCost.toFixed(4)} known so far`
+    : `$${(Number.isFinite(App.sessionCost) && App.sessionCost >= 0 ? App.sessionCost : 0).toFixed(4)} known subtotal; actual session spend is incomplete`;
+  const proposed = estimateKnown
+    ? `estimated request cost up to $${additionalEstimate.toFixed(4)}`
+    : 'request cost unknown for this provider/model';
+  return confirm(`Session cap is $${cap.toFixed(2)}. Current spend: ${current}; ${proposed}. Continue with this ${requestLabel}? Estimates are approximate and provider billing may differ.`);
 }
 
 
 function getMentionedSeats(text) {
   const found = [];
-  const lower = text.toLowerCase();
+  const lower = String(text || '').toLowerCase();
   for (const seat of activeSeats()) {
     // Match @SeatName (case-insensitive). Explicit mention counts as calling, including Moderator.
     const name = seat.name.toLowerCase();
@@ -1068,15 +1244,21 @@ function getMentionedSeats(text) {
   return found.map(f => f.seat);
 }
 
+function canStartDiscussion(text) {
+  return activeDiscussionSeats().length > 0 || (
+    App.turnMode === 'mention' && getMentionedSeats(text).some(isModeratorSeat)
+  );
+}
+
 function buildTurnOrder(mode, roundIndex) {
-  const base = activeDiscussionSeats(); // moderator excluded from auto rounds
-  if (!base.length) return [];
+  const base = activeDiscussionSeats(); // moderator excluded from automatic rounds
   if (mode === 'mention') {
     const lastUser = [...App.messages].reverse().find(m => m.role === 'user');
     const mentioned = lastUser ? getMentionedSeats(lastUser.content) : [];
     if (mentioned.length) return mentioned;
     return base; // fallback
   }
+  if (!base.length) return [];
   if (mode === 'rotating') {
     const offset = (App.rotationOffset + roundIndex) % base.length;
     return [...base.slice(offset), ...base.slice(0, offset)];
@@ -1097,21 +1279,30 @@ function sleep(ms, signal) {
 function abortError() { const e = new Error('Aborted'); e.name = 'AbortError'; return e; }
 
 async function callSeat(seat, { isModeratorCall = false } = {}) {
-  if (!seat.enabled) return;
+  if (!seat.enabled) return true;
   if (!seat.model) {
     addSeatErrorMessage(seat, `No model selected for ${seat.name}. Open Settings/Seats and choose a model.`);
-    return;
+    return true;
   }
-  // Spending cap check (rough estimate)
-  if (!checkSpendingCap(0)) {
-    setStatus('Paused: spending cap reached.');
-    return;
+
+  // Build the prompt before adding the in-flight placeholder, so the model never sees
+  // an empty assistant message representing its own response.
+  const maxTokens = getOutputTokenLimit(seat.provider, seat.model);
+  const prompt = buildConversationMessagesForSeat(seat, maxTokens);
+  App.contextTruncated = App.contextTruncated || prompt.truncated;
+  updateStats();
+  const estimatedCost = estimateRequestCost(seat.provider, seat.model, prompt.messages, maxTokens);
+  const requestLabel = isModeratorCall ? 'Moderator response' : `${seat.name} response`;
+  if (!checkSpendingCap(estimatedCost, requestLabel)) {
+    setStatus('Paused: spending cap reached; request was not sent.', 'warn');
+    return false;
   }
 
   const msgId = uid();
   const msg = {
     id: msgId, role: 'seat', speaker: seat.name, seatId: seat.id, color: seat.color,
-    content: '', ts: Date.now(), usage: null, cost: 0, error: false, rateLimited: false, streaming: true
+    content: '', ts: Date.now(), usage: null, cost: null, costKnown: false,
+    error: false, rateLimited: false, streaming: true
   };
   App.messages.push(msg);
   renderThread();
@@ -1119,21 +1310,24 @@ async function callSeat(seat, { isModeratorCall = false } = {}) {
 
   App.currentSeatId = seat.id;
   App.skipRequested = false;
+  updateControls();
   const controller = new AbortController();
   App.abortController = controller;
 
-  let promptTokens = 0, completionTokens = 0;
-  const onToken = (t) => {
+  let promptTokens = null, completionTokens = null;
+  let outputReceived = false;
+  const onToken = (token) => {
     if (App.skipRequested) return;
-    msg.content += t;
+    if (token) outputReceived = true;
+    msg.content += token;
     updateMessageContent(msgId, msg.content, true);
   };
-  const onUsage = (u) => { promptTokens = u.prompt || 0; completionTokens = u.completion || 0; };
+  const onUsage = usage => { promptTokens = usage.prompt; completionTokens = usage.completion; };
 
   const attempt = async () => {
-    const messages = buildConversationMessagesForSeat(seat);
     await streamProvider({
-      providerId: seat.provider, model: seat.model, messages, temperature: Number(seat.temperature ?? 0.7),
+      providerId: seat.provider, model: seat.model, messages: prompt.messages,
+      temperature: Number(seat.temperature ?? 0.7), maxTokens,
       signal: controller.signal, onToken, onUsage
     });
   };
@@ -1141,7 +1335,6 @@ async function callSeat(seat, { isModeratorCall = false } = {}) {
   const maxAttempts = 2; // initial + 1 retry for 429
   let attemptNum = 0;
   let succeeded = false;
-  let lastErr = null;
   while (attemptNum < maxAttempts) {
     attemptNum++;
     try {
@@ -1150,7 +1343,6 @@ async function callSeat(seat, { isModeratorCall = false } = {}) {
       succeeded = true;
       break;
     } catch (err) {
-      lastErr = err;
       if (err.name === 'AbortError' || controller.signal.aborted) {
         if (App.skipRequested) {
           msg.content = msg.content ? msg.content + '\n\n[Skipped]' : '[Skipped]';
@@ -1158,6 +1350,8 @@ async function callSeat(seat, { isModeratorCall = false } = {}) {
         } else {
           msg.content = msg.content ? msg.content + '\n\n[Stopped]' : '[Stopped]';
         }
+        App.sessionCostKnown = false; // providers may bill for an interrupted request
+        msg.costKnown = false;
         break;
       }
       const status = err.status || 0;
@@ -1165,7 +1359,6 @@ async function callSeat(seat, { isModeratorCall = false } = {}) {
       if (is429 && attemptNum < maxAttempts) {
         setStatus(`${seat.name}: rate limited (429). Backing off and retrying once...`);
         try { await sleep(1500 + Math.random() * 1000, controller.signal); } catch { break; }
-        // clear partial content before retry
         msg.content = '';
         updateMessageContent(msgId, msg.content, true);
         continue;
@@ -1181,53 +1374,74 @@ async function callSeat(seat, { isModeratorCall = false } = {}) {
         msg.content = `[Error] ${friendly}`;
         setStatus(`${seat.name}: ${friendly}`);
       }
+      // Network failures and provider-side errors may happen after a billable request
+      // reached the provider, even when no output chunk arrived. Keep that spend unknown.
+      if (!is429 && (outputReceived || !status || status >= 500)) {
+        App.sessionCostKnown = false;
+        msg.costKnown = false;
+      }
       break;
     }
   }
 
   msg.streaming = false;
   if (succeeded) {
-    // Estimate tokens if provider didn't give usage
-    if (!promptTokens && !completionTokens) {
-      promptTokens = estimateTokensRough(buildConversationMessagesForSeat(seat).map(m=>m.content).join('\n'));
-      completionTokens = estimateTokensRough(msg.content);
-    }
+    const usageComplete = isValidUsageCount(promptTokens) && isValidUsageCount(completionTokens);
+    if (!usageComplete) App.sessionCostKnown = false;
+    promptTokens = isValidUsageCount(promptTokens) ? Number(promptTokens) : estimateMessagesTokens(prompt.messages);
+    completionTokens = isValidUsageCount(completionTokens) ? Number(completionTokens) : estimateTokensRough(msg.content);
+    promptTokens = normalizeUsageCount(promptTokens);
+    completionTokens = normalizeUsageCount(completionTokens);
     msg.usage = { prompt: promptTokens, completion: completionTokens };
     msg.cost = trackUsage(seat.provider, seat.model, promptTokens, completionTokens, seat.name);
-    // Spending cap post-check - if over, warn (next call will pause)
-    if (App.capEnabled && Number(App.spendingCap) > 0 && App.sessionCost > Number(App.spendingCap) && !App.capApprovedOverage) {
-      setStatus(`Spending cap reached ($${App.sessionCost.toFixed(4)} / $${Number(App.spendingCap).toFixed(2)}). You'll be asked before continuing.`);
+    msg.costKnown = msg.cost !== null && usageComplete;
+    if (!App.sessionCostKnown) {
+      setStatus('Provider pricing or reliable usage data is incomplete; this is only the known cost subtotal.', 'warn');
+    } else if (App.capEnabled && Number(App.spendingCap) > 0 && App.sessionCost > Number(App.spendingCap)) {
+      setStatus(`Session cap exceeded ($${App.sessionCost.toFixed(4)} / $${Number(App.spendingCap).toFixed(2)}); the next request will require confirmation.`, 'warn');
     }
+  } else if (!App.sessionCostKnown) {
+    setStatus('Request was interrupted or returned partial output; actual provider charges may be unknown.', 'warn');
   }
+  updateStats();
   updateMessageContent(msgId, msg.content, false);
   App.currentSeatId = null;
   App.abortController = null;
   App.skipRequested = false;
+  updateControls();
   persistCurrentSession();
+  return true;
 }
 
 async function runRounds({ count = 1, moderatorOnly = false } = {}) {
-  if (App.running) return;
+  if (App.runInFlight || App.running) return;
   const seatsToRun = moderatorOnly ? App.seats.filter(s => isModeratorSeat(s) && s.enabled) : null;
   if (moderatorOnly && (!seatsToRun || !seatsToRun.length)) {
     setStatus('No enabled Moderator seat found.');
     return;
   }
-  if (!moderatorOnly && !activeDiscussionSeats().length) {
-    setStatus('No active seats. Enable at least one seat in the panel.');
+  const lastUser = [...App.messages].reverse().find(message => message.role === 'user');
+  if (!moderatorOnly && !canStartDiscussion(lastUser?.content)) {
+    const hasModerator = activeSeats().some(isModeratorSeat);
+    setStatus(hasModerator
+      ? 'No discussion seats are enabled. Mention @Moderator in Mention mode or use Call Moderator.'
+      : 'No active seats. Enable at least one seat in the panel.');
     return;
   }
+  App.runInFlight = true;
   App.running = true;
+  App.contextTruncated = false;
   updateControls();
   setStatus(moderatorOnly ? 'Calling Moderator...' : 'Running discussion...');
   try {
-    await maybeSummarizeContext();
+    const mayContinue = await maybeSummarizeContext();
+    if (!mayContinue) { App.running = false; return; }
     if (moderatorOnly) {
       for (const seat of seatsToRun) {
         if (!App.running) break;
-        if (!checkSpendingCap(0)) { setStatus('Paused: spending cap reached.'); break; }
-        await callSeat(seat, { isModeratorCall: true });
-        if (App.abortController === null && !App.running) break;
+        const mayContinue = await callSeat(seat, { isModeratorCall: true });
+        if (!mayContinue) { App.running = false; break; }
+        if (!App.running) break;
       }
     } else {
       const rounds = clamp(Number(count) || 1, 1, 5);
@@ -1239,11 +1453,9 @@ async function runRounds({ count = 1, moderatorOnly = false } = {}) {
           if (!App.running) break;
           const seat = getSeatById(order[i].id);
           if (!seat || !seat.enabled) continue;
-          if (!checkSpendingCap(0)) { setStatus('Paused: spending cap reached.'); App.running = false; break; }
           setStatus(`Round ${r+1}/${rounds}: ${seat.name} is responding...`);
-          await callSeat(seat);
-          // If aborted by Stop button (not skip), stop whole run
-          const last = App.messages[App.messages.length - 1];
+          const mayContinue = await callSeat(seat);
+          if (!mayContinue) { App.running = false; break; }
           if (!App.running) break;
         }
       }
@@ -1256,11 +1468,14 @@ async function runRounds({ count = 1, moderatorOnly = false } = {}) {
     App.currentSeatId = null;
     App.abortController = null;
     App.skipRequested = false;
-    updateControls();
-    if (!/Paused: spending cap/.test(document.getElementById('statusLine').textContent)) {
-      setStatus('Ready.');
+    const statusEl = document.getElementById('statusLine');
+    if (!statusEl.classList.contains('warn') && !statusEl.classList.contains('err')) setStatus('Ready.');
+    try {
+      persistCurrentSession();
+    } finally {
+      App.runInFlight = false;
+      updateControls();
     }
-    persistCurrentSession();
   }
 }
 
@@ -1283,28 +1498,38 @@ function skipCurrentSeat() {
 }
 
 async function regenerateLast() {
-  if (App.running) { setStatus('Stop the current run before regenerating.'); return; }
+  if (App.runInFlight || App.running) { setStatus('Stop the current run before regenerating.'); return; }
   // Find last seat message
   for (let i = App.messages.length - 1; i >= 0; i--) {
     const m = App.messages[i];
     if (m.role === 'seat') {
       const seat = getSeatById(m.seatId) || App.seats.find(s => s.name === m.speaker);
       if (!seat) { setStatus('Could not find seat for last message.'); return; }
-      // Remove that message
+      // Remove the response from prompt context, but restore it if the user declines the cap prompt.
       App.messages.splice(i, 1);
-      // Adjust session cost/tokens? Keep session totals as spent (actual cost incurred).
       renderThread();
+      App.contextTruncated = false;
+      App.runInFlight = true;
       App.running = true;
       updateControls();
       setStatus(`Regenerating ${seat.name}...`);
       try {
-        await callSeat(seat);
+        const regenerated = await callSeat(seat);
+        if (!regenerated) {
+          App.messages.splice(i, 0, m);
+          renderThread();
+        }
       } finally {
         App.running = false;
         App.currentSeatId = null;
-        updateControls();
-        setStatus('Ready.');
-        persistCurrentSession();
+        const statusEl = document.getElementById('statusLine');
+        if (!statusEl.classList.contains('warn') && !statusEl.classList.contains('err')) setStatus('Ready.');
+        try {
+          persistCurrentSession();
+        } finally {
+          App.runInFlight = false;
+          updateControls();
+        }
       }
       return;
     }
@@ -1326,20 +1551,37 @@ function setStatus(msg, cls = '') {
 function updateStats() {
   const totalTokens = App.sessionTokens.prompt + App.sessionTokens.completion;
   $('statTokens').textContent = `${totalTokens.toLocaleString()} tokens`;
-  $('statCost').textContent = `$${App.sessionCost.toFixed(4)} session`;
+  $('statCost').textContent = App.sessionCostKnown
+    ? `$${App.sessionCost.toFixed(4)} session`
+    : `$${App.sessionCost.toFixed(4)} known · actual unknown`;
+  $('statCost').title = App.sessionCostKnown
+    ? 'Estimated cost based on available provider usage and pricing.'
+    : 'This is only the known subtotal. Provider pricing or reliable usage data may be incomplete, or a request may have been interrupted.';
   $('statMode').textContent = App.turnMode.charAt(0).toUpperCase() + App.turnMode.slice(1);
   const cap = Number(App.spendingCap);
   const capNote = (App.capEnabled && cap > 0) ? ` · cap $${cap.toFixed(2)}` : '';
-  $('contextInfo').textContent = `${App.messages.filter(m=>m.role!=='system').length} msgs${App.runningBrief ? ' · briefed' : ''}${capNote}`;
+  const contextNote = App.contextTruncated ? ' · context trimmed' : '';
+  $('contextInfo').textContent = `${App.messages.filter(m=>m.role!=='system').length} msgs${App.runningBrief ? ' · briefed' : ''}${contextNote}${capNote}`;
 }
 
 function updateControls() {
+  const busy = App.runInFlight || App.running || !!App.abortController;
   $('btnStop').disabled = !App.running;
   $('btnSkip').disabled = !App.running || !App.currentSeatId;
-  $('btnSend').disabled = App.running;
-  $('btnAnotherRound').disabled = App.running;
-  $('btnCallModerator').disabled = App.running;
-  $('btnRegen').disabled = App.running;
+  $('btnSend').disabled = busy;
+  $('btnAnotherRound').disabled = busy;
+  $('btnCallModerator').disabled = busy;
+  $('btnRegen').disabled = busy;
+
+  for (const id of ['btnSettings', 'sessionSelect', 'btnNewSession', 'btnSaveSession', 'btnDeleteSession', 'btnClearThread', 'btnImportJson', 'importFileInput', 'btnResetSeats', 'btnSavePreset', 'btnLoadPreset', 'presetName', 'presetSelect', 'btnImportPresets', 'importPresetsInput', 'turnMode', 'rounds']) {
+    const control = $(id);
+    if (control) control.disabled = busy;
+  }
+  $('btnAddSeat').disabled = busy || App.seats.length >= MAX_SEATS;
+  $('seatsList').querySelectorAll('input,select,textarea,button').forEach(control => { control.disabled = busy; });
+  $('settingsOverlay').querySelectorAll('input,select,textarea,button').forEach(control => {
+    if (control.id !== 'btnCloseSettings') control.disabled = busy;
+  });
 }
 
 function scrollThreadToBottom() {
@@ -1369,6 +1611,17 @@ function renderMarkdownLite(text) {
   return s;
 }
 
+function messageMetaParts(message) {
+  const parts = [];
+  if (message.usage) parts.push(`${message.usage.prompt + message.usage.completion} tok`);
+  const hasCost = message.cost !== null && message.cost !== undefined && message.cost !== '' && Number.isFinite(Number(message.cost));
+  if (message.costKnown === false) parts.push(hasCost ? `~$${Number(message.cost).toFixed(5)} est.` : 'cost unknown');
+  else if (hasCost) parts.push(`$${Number(message.cost).toFixed(5)}`);
+  if (message.rateLimited) parts.push('rate-limited');
+  if (message.streaming) parts.push('streaming');
+  return parts;
+}
+
 function renderThread() {
   const thread = $('thread');
   const empty = $('emptyState');
@@ -1377,15 +1630,12 @@ function renderThread() {
   empty.style.display = msgs.length ? 'none' : 'block';
   for (const m of msgs) {
     const div = document.createElement('div');
+    const messageId = String(m.id || uid());
     div.className = 'message' + (m.role === 'user' ? ' user' : '') + (m.error ? ' error' : '');
-    div.dataset.msgId = m.id;
+    div.dataset.msgId = messageId;
     const color = m.role === 'user' ? '#a8b3c7' : (m.color || '#6ea8fe');
     const initial = (m.speaker || 'U').slice(0,1).toUpperCase();
-    const metaParts = [];
-    if (m.usage) metaParts.push(`${m.usage.prompt + m.usage.completion} tok`);
-    if (m.cost) metaParts.push(`$${m.cost.toFixed(5)}`);
-    if (m.rateLimited) metaParts.push('rate-limited');
-    if (m.streaming) metaParts.push('streaming');
+    const metaParts = messageMetaParts(m);
     const time = m.ts ? new Date(m.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
     div.innerHTML = `
       <div class="avatar" style="background:${escapeHtml(color)}">${escapeHtml(initial)}</div>
@@ -1394,15 +1644,18 @@ function renderThread() {
           <span class="speaker" style="color:${escapeHtml(color)}">${escapeHtml(m.speaker || 'User')}</span>
           <span class="msg-meta">${escapeHtml(time)}${metaParts.length ? ' · ' + escapeHtml(metaParts.join(' · ')) : ''}</span>
         </div>
-        <div class="content ${m.streaming ? 'streaming' : ''}" id="content_${m.id}">${renderMarkdownLite(m.content || '')}</div>
+        <div class="content ${m.streaming ? 'streaming' : ''}">${renderMarkdownLite(m.content || '')}</div>
       </div>`;
+    const contentElement = div.querySelector('.content');
+    if (contentElement) contentElement.id = `content_${messageId}`;
     thread.appendChild(div);
   }
 }
 
 function updateMessageContent(msgId, content, streaming) {
-  const el = document.getElementById('content_' + msgId);
-  const msg = App.messages.find(m => m.id === msgId);
+  const safeMessageId = String(msgId);
+  const el = document.getElementById('content_' + safeMessageId);
+  const msg = App.messages.find(m => String(m.id) === safeMessageId);
   if (msg) { msg.content = content; msg.streaming = !!streaming; }
   if (el) {
     el.innerHTML = renderMarkdownLite(content || '');
@@ -1410,17 +1663,13 @@ function updateMessageContent(msgId, content, streaming) {
   } else {
     renderThread();
   }
-  // Update meta for this message if present
   if (msg) {
-    const msgEl = document.querySelector(`.message[data-msg-id="${msgId}"] .msg-meta`);
-    if (msgEl) {
-      const metaParts = [];
-      if (msg.usage) metaParts.push(`${msg.usage.prompt + msg.usage.completion} tok`);
-      if (msg.cost) metaParts.push(`$${msg.cost.toFixed(5)}`);
-      if (msg.rateLimited) metaParts.push('rate-limited');
-      if (msg.streaming) metaParts.push('streaming');
+    const messageEl = Array.from(document.querySelectorAll('.message')).find(node => node.dataset.msgId === safeMessageId);
+    const metaEl = messageEl?.querySelector('.msg-meta');
+    if (metaEl) {
+      const metaParts = messageMetaParts(msg);
       const time = msg.ts ? new Date(msg.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
-      msgEl.textContent = time + (metaParts.length ? ' · ' + metaParts.join(' · ') : '');
+      metaEl.textContent = time + (metaParts.length ? ' · ' + metaParts.join(' · ') : '');
     }
   }
   scrollThreadToBottom();
@@ -1429,7 +1678,7 @@ function updateMessageContent(msgId, content, streaming) {
 function addSeatErrorMessage(seat, text) {
   App.messages.push({
     id: uid(), role: 'seat', speaker: seat.name, seatId: seat.id, color: seat.color,
-    content: text, ts: Date.now(), usage: null, cost: 0, error: true, rateLimited: false, streaming: false
+    content: text, ts: Date.now(), usage: null, cost: null, costKnown: null, error: true, rateLimited: false, streaming: false
   });
   renderThread();
   scrollThreadToBottom();
@@ -1500,6 +1749,7 @@ function renderSeats() {
       </details>`;
     list.appendChild(card);
   });
+  $('btnAddSeat').disabled = App.runInFlight || App.running || !!App.abortController || App.seats.length >= MAX_SEATS;
 }
 
 function refreshAllSeatModelDropdowns() {
@@ -1550,7 +1800,7 @@ function bindSeatEvents() {
     const idx = App.seats.findIndex(s => s.id === id);
     if (idx === -1) return;
     if (action === 'remove') {
-      if (App.seats.length <= 1) { setStatus('Keep at least one seat.'); return; }
+      if (App.seats.length <= 2) { setStatus('Keep at least two seats.'); return; }
       App.seats.splice(idx, 1);
       renderSeats(); persistSettings();
     }
@@ -1594,7 +1844,7 @@ function bindSettings() {
   for (const [elId, keyName] of keyBindings) {
     $(elId).addEventListener('input', (e) => {
       ProviderState.keys[keyName] = e.target.value.trim();
-      if (ProviderState.rememberKeys) saveKeysToStorage();
+      if (ProviderState.rememberKeys && !saveKeysToStorage()) showStorageWriteFailure();
     });
   }
   $('ollamaBaseUrl').addEventListener('input', (e) => { ProviderState.ollamaBaseUrl = e.target.value.trim(); persistSettings(); });
@@ -1606,13 +1856,28 @@ function bindSettings() {
 }
 
 function saveKeysToStorage() {
-  if (!ProviderState.rememberKeys) return;
-  Storage.set(STORAGE_KEYS.keys, { ...ProviderState.keys });
+  if (!ProviderState.rememberKeys) return true;
+  return Storage.set(STORAGE_KEYS.keys, { ...ProviderState.keys });
 }
 
 /* ---- Sessions / persistence ---- */
-function getSessionsStore() { return Storage.get(STORAGE_KEYS.sessions, {}); }
-function saveSessionsStore(store) { Storage.set(STORAGE_KEYS.sessions, store); }
+function getSessionsStore() {
+  const store = Storage.get(STORAGE_KEYS.sessions, {});
+  return store && typeof store === 'object' && !Array.isArray(store) ? store : {};
+}
+function saveSessionsStore(store) { return Storage.set(STORAGE_KEYS.sessions, store); }
+
+function showStorageWriteFailure() {
+  const message = 'Could not save to this browser storage. Export the thread JSON before closing, then free storage or use a browser with storage enabled.';
+  const storageStatus = $('storageStatus');
+  if (storageStatus) storageStatus.textContent = message;
+  if ($('statusLine')) setStatus(message, 'warn');
+}
+
+function showStorageWriteSuccess() {
+  const storageStatus = $('storageStatus');
+  if (storageStatus && Storage.available) storageStatus.textContent = 'Sessions and settings are saved in localStorage.';
+}
 
 function persistSettings() {
   const settings = {
@@ -1626,13 +1891,19 @@ function persistSettings() {
     seats: exportSeatLineup(),
     currentSessionId: App.currentSessionId
   };
-  Storage.set(STORAGE_KEYS.settings, settings);
-  if (ProviderState.rememberKeys) saveKeysToStorage();
+  let saved = Storage.set(STORAGE_KEYS.settings, settings);
+  if (ProviderState.rememberKeys) saved = saveKeysToStorage() && saved;
   else Storage.remove(STORAGE_KEYS.keys);
+  if (!saved) showStorageWriteFailure();
+  return saved;
 }
 
 function persistCurrentSession() {
-  if (!Storage.available) { updateSessionSelect(); return; }
+  if (!Storage.available) {
+    updateSessionSelect();
+    showStorageWriteFailure();
+    return false;
+  }
   if (!App.currentSessionId) App.currentSessionId = uid();
   const store = getSessionsStore();
   store[App.currentSessionId] = {
@@ -1644,38 +1915,77 @@ function persistCurrentSession() {
     runningBrief: App.runningBrief,
     summarizedMessageCount: App.summarizedMessageCount,
     sessionCost: App.sessionCost,
+    sessionCostKnown: App.sessionCostKnown,
     sessionTokens: App.sessionTokens,
     turnMode: App.turnMode,
     rounds: App.rounds,
     rotationOffset: App.rotationOffset,
     spendingCap: App.spendingCap,
-    capEnabled: App.capEnabled
+    capEnabled: App.capEnabled,
+    contextTruncated: App.contextTruncated
   };
-  saveSessionsStore(store);
-  Storage.set(STORAGE_KEYS.currentSession, App.currentSessionId);
+  if (!saveSessionsStore(store)) {
+    showStorageWriteFailure();
+    return false;
+  }
+  const pointerSaved = Storage.set(STORAGE_KEYS.currentSession, App.currentSessionId);
   updateSessionSelect();
-  persistSettings();
+  const settingsSaved = persistSettings();
+  if (!pointerSaved || !settingsSaved) {
+    showStorageWriteFailure();
+    return false;
+  }
+  showStorageWriteSuccess();
+  return true;
+}
+
+function canChangeSessions() { return !App.runInFlight && !App.running && !App.abortController; }
+
+function sessionChangesAllowed() {
+  if (canChangeSessions()) return true;
+  setStatus('Stop the current run before switching sessions or changing seat lineups.', 'warn');
+  return false;
 }
 
 function loadSession(id) {
+  if (!sessionChangesAllowed()) return false;
   const store = getSessionsStore();
   const s = store[id];
-  if (!s) return;
-  App.currentSessionId = s.id;
-  App.sessionName = s.name || 'Session';
-  App.messages = Array.isArray(s.messages) ? s.messages : [];
-  App.runningBrief = s.runningBrief || '';
-  App.summarizedMessageCount = Number(s.summarizedMessageCount) || 0;
-  App.sessionCost = Number(s.sessionCost) || 0;
-  App.sessionTokens = s.sessionTokens || { prompt: 0, completion: 0 };
-  App.turnMode = s.turnMode || App.turnMode;
-  App.rounds = clamp(Number(s.rounds)||1,1,5);
-  App.rotationOffset = Number(s.rotationOffset) || 0;
-  App.spendingCap = Number(s.spendingCap ?? App.spendingCap);
+  if (!s || typeof s !== 'object') return false;
+
+  let messageDataValid = true;
+  try {
+    if (!Array.isArray(s.messages)) throw new Error('Stored messages are not an array.');
+    App.messages = normalizeImportedMessages(s.messages);
+  } catch (error) {
+    App.messages = [];
+    messageDataValid = false;
+  }
+  App.currentSessionId = String(id);
+  App.sessionName = String(s.name || 'Session').slice(0, 100);
+  App.runningBrief = typeof s.runningBrief === 'string' ? s.runningBrief.slice(0, 4000) : '';
+  App.summarizedMessageCount = Math.min(App.messages.length, Math.max(0, Number(s.summarizedMessageCount) || 0));
+  const storedSessionCost = Number(s.sessionCost);
+  const sessionCostValid = Number.isFinite(storedSessionCost) && storedSessionCost >= 0;
+  App.sessionCost = sessionCostValid ? storedSessionCost : 0;
+  App.sessionCostKnown = s.sessionCostKnown === true && messageDataValid && sessionCostValid;
+  const storedPromptTokens = Number(s.sessionTokens?.prompt);
+  const storedCompletionTokens = Number(s.sessionTokens?.completion);
+  App.sessionTokens = {
+    prompt: Number.isFinite(storedPromptTokens) && storedPromptTokens >= 0 ? storedPromptTokens : 0,
+    completion: Number.isFinite(storedCompletionTokens) && storedCompletionTokens >= 0 ? storedCompletionTokens : 0
+  };
+  App.turnMode = ['serial', 'rotating', 'mention'].includes(s.turnMode) ? s.turnMode : App.turnMode;
+  App.rounds = clamp(Number(s.rounds) || 1, 1, 5);
+  const storedRotationOffset = Number(s.rotationOffset);
+  App.rotationOffset = Number.isFinite(storedRotationOffset) && storedRotationOffset >= 0 ? storedRotationOffset : 0;
+  const storedCap = Number(s.spendingCap ?? App.spendingCap);
+  App.spendingCap = Number.isFinite(storedCap) && storedCap >= 0 ? storedCap : 1;
   App.capEnabled = s.capEnabled !== false;
-  App.capApprovedOverage = false;
+  App.contextTruncated = !!s.contextTruncated;
   if (Array.isArray(s.seats) && s.seats.length) {
-    try { importSeatLineup(s.seats); } catch {}
+    try { App.seats = normalizeSeatLineup(s.seats); }
+    catch { /* retain the current valid lineup if stored seat data is malformed */ }
   }
   $('turnMode').value = App.turnMode;
   $('rounds').value = String(App.rounds);
@@ -1685,35 +1995,40 @@ function loadSession(id) {
   renderSeats();
   updateStats();
   updateControls();
-  Storage.set(STORAGE_KEYS.currentSession, id);
+  const pointerSaved = Storage.set(STORAGE_KEYS.currentSession, id);
   updateSessionSelect();
-  setStatus(`Loaded session: ${App.sessionName}`);
+  if (!pointerSaved) showStorageWriteFailure();
+  else setStatus(messageDataValid ? `Loaded session: ${App.sessionName}` : 'Session loaded, but its message data was invalid and has been discarded.', messageDataValid ? '' : 'warn');
+  return true;
 }
 
 function newSession() {
+  if (!sessionChangesAllowed()) return false;
   App.currentSessionId = uid();
   App.sessionName = 'Session ' + new Date().toLocaleString();
   App.messages = [];
   App.runningBrief = '';
   App.summarizedMessageCount = 0;
   App.sessionCost = 0;
+  App.sessionCostKnown = true;
   App.sessionTokens = { prompt: 0, completion: 0 };
-  App.capApprovedOverage = false;
+  App.contextTruncated = false;
   App.rotationOffset = 0;
   renderThread();
   updateStats();
-  persistCurrentSession();
-  setStatus('New session created.');
+  const saved = persistCurrentSession();
+  if (saved) setStatus('New session created.');
+  return saved;
 }
 
 function deleteCurrentSession() {
-  if (!App.currentSessionId) return;
+  if (!sessionChangesAllowed() || !App.currentSessionId) return false;
   const store = getSessionsStore();
   delete store[App.currentSessionId];
-  saveSessionsStore(store);
+  if (!saveSessionsStore(store)) { showStorageWriteFailure(); return false; }
   const ids = Object.keys(store);
-  if (ids.length) loadSession(ids.sort((a,b)=>(store[b].updatedAt||0)-(store[a].updatedAt||0))[0]);
-  else newSession();
+  if (ids.length) return loadSession(ids.sort((a,b)=>(store[b].updatedAt||0)-(store[a].updatedAt||0))[0]);
+  return newSession();
 }
 
 function updateSessionSelect() {
@@ -1729,6 +2044,47 @@ function updateSessionSelect() {
 }
 
 /* ---- Export / Import ---- */
+function normalizeImportedMessages(messages) {
+  if (!Array.isArray(messages)) throw new Error('Thread messages must be an array.');
+  if (messages.length > 10000) throw new Error('Import contains too many messages (maximum 10,000).');
+  return messages.map((message, index) => {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      throw new Error(`Message ${index + 1} is invalid.`);
+    }
+    if (!['user', 'seat'].includes(message.role)) {
+      throw new Error(`Message ${index + 1} has an unsupported role.`);
+    }
+    if (typeof message.content !== 'string' || message.content.length > 1000000) {
+      throw new Error(`Message ${index + 1} has invalid or oversized content.`);
+    }
+    const rawCost = message.cost;
+    const costKnown = message.role === 'seat' && message.costKnown === true
+      && typeof rawCost === 'number' && Number.isFinite(rawCost) && rawCost >= 0;
+    const rawUsage = message.usage && typeof message.usage === 'object' ? message.usage : null;
+    const promptUsage = Number(rawUsage?.prompt);
+    const completionUsage = Number(rawUsage?.completion);
+    return {
+      // Ignore IDs supplied by the file: all in-app IDs are freshly generated and safe to use in the DOM.
+      id: uid(),
+      role: message.role,
+      speaker: String(message.speaker || (message.role === 'user' ? 'You' : 'Seat')).slice(0, 80),
+      seatId: typeof message.seatId === 'string' ? message.seatId.slice(0, 100) : null,
+      color: /^#[0-9a-fA-F]{6}$/.test(String(message.color || '')) ? message.color : '#6ea8fe',
+      content: message.content,
+      ts: Number.isFinite(Number(message.ts)) && Number(message.ts) > 0 ? Number(message.ts) : Date.now(),
+      usage: rawUsage ? {
+        prompt: Number.isFinite(promptUsage) && promptUsage >= 0 ? promptUsage : 0,
+        completion: Number.isFinite(completionUsage) && completionUsage >= 0 ? completionUsage : 0
+      } : null,
+      cost: costKnown ? rawCost : null,
+      costKnown: message.role === 'user' ? null : costKnown,
+      error: !!message.error,
+      rateLimited: !!message.rateLimited,
+      streaming: false
+    };
+  });
+}
+
 function exportThreadMarkdown() {
   const lines = [];
   lines.push('# COAI Think Tank Export');
@@ -1736,7 +2092,7 @@ function exportThreadMarkdown() {
   lines.push(`- Exported: ${new Date().toISOString()}`);
   lines.push(`- Turn mode: ${App.turnMode}`);
   lines.push(`- Rounds: ${App.rounds}`);
-  lines.push(`- Session cost: $${App.sessionCost.toFixed(4)}`);
+  lines.push(`- Session cost: $${App.sessionCost.toFixed(4)} known subtotal${App.sessionCostKnown ? '' : ' (actual spend incomplete)'}`);
   lines.push(`- Tokens: ${App.sessionTokens.prompt + App.sessionTokens.completion} (prompt ${App.sessionTokens.prompt}, completion ${App.sessionTokens.completion})`);
   lines.push('');
   lines.push('## Seats');
@@ -1756,7 +2112,13 @@ function exportThreadMarkdown() {
     const who = m.speaker || 'User';
     const when = m.ts ? new Date(m.ts).toLocaleString() : '';
     lines.push(`### ${who}${when ? ` (${when})` : ''}`);
-    if (m.usage) lines.push(`_${m.usage.prompt + m.usage.completion} tokens, $${(m.cost||0).toFixed(5)}_`);
+    if (m.usage) {
+      const hasCost = m.cost !== null && m.cost !== undefined && m.cost !== '' && Number.isFinite(Number(m.cost));
+      const costNote = m.costKnown === false
+        ? (hasCost ? `~$${Number(m.cost).toFixed(5)} estimated; actual unknown` : 'cost unknown')
+        : (hasCost ? `$${Number(m.cost).toFixed(5)}` : 'cost unavailable');
+      lines.push(`_${m.usage.prompt + m.usage.completion} tokens, ${costNote}_`);
+    }
     lines.push('');
     lines.push(m.content || '');
     lines.push('');
@@ -1775,7 +2137,9 @@ function exportThreadJSON() {
     runningBrief: App.runningBrief,
     summarizedMessageCount: App.summarizedMessageCount,
     sessionCost: App.sessionCost,
+    sessionCostKnown: App.sessionCostKnown,
     sessionTokens: App.sessionTokens,
+    contextTruncated: App.contextTruncated,
     turnMode: App.turnMode,
     rounds: App.rounds,
     rotationOffset: App.rotationOffset,
@@ -1794,25 +2158,56 @@ function downloadBlob(blob, filename) {
 }
 
 function importThreadJSON(file) {
+  if (!sessionChangesAllowed()) return;
+  if (!file || file.size > 10 * 1024 * 1024) {
+    setStatus('Import file is missing or exceeds the 10 MB limit.', 'err');
+    return;
+  }
   const reader = new FileReader();
+  reader.onerror = () => setStatus('Could not read the selected import file.', 'err');
   reader.onload = () => {
     try {
+      if (!sessionChangesAllowed()) return;
       const data = JSON.parse(String(reader.result || ''));
-      // Accept either our export format or a raw session-like object
-      if (Array.isArray(data.seats)) importSeatLineup(data.seats);
-      if (Array.isArray(data.messages)) App.messages = data.messages;
-      App.runningBrief = typeof data.runningBrief === 'string' ? data.runningBrief : '';
-      App.summarizedMessageCount = Number(data.summarizedMessageCount) || 0;
-      App.sessionCost = Number(data.sessionCost) || 0;
-      App.sessionTokens = data.sessionTokens && typeof data.sessionTokens === 'object' ? { prompt: Number(data.sessionTokens.prompt)||0, completion: Number(data.sessionTokens.completion)||0 } : {prompt:0,completion:0};
+      if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Import must contain a JSON object.');
+      if (!Array.isArray(data.messages)) throw new Error('Import must contain a messages array.');
+
+      // Normalize all untrusted fields before changing the current app state.
+      const normalizedMessages = normalizeImportedMessages(data.messages);
+      const normalizedSeats = data.seats === undefined ? null : normalizeSeatLineup(data.seats);
+      if (data.turnMode !== undefined && !['serial', 'rotating', 'mention'].includes(data.turnMode)) {
+        throw new Error('Import contains an invalid turn mode.');
+      }
+      const importedCost = Number(data.sessionCost ?? 0);
+      if (!Number.isFinite(importedCost) || importedCost < 0) throw new Error('Import contains an invalid session cost.');
+      const importedTokens = data.sessionTokens && typeof data.sessionTokens === 'object' ? data.sessionTokens : {};
+      const promptTokens = Number(importedTokens.prompt);
+      const completionTokens = Number(importedTokens.completion);
+      const sessionTokens = {
+        prompt: Number.isFinite(promptTokens) && promptTokens >= 0 ? promptTokens : 0,
+        completion: Number.isFinite(completionTokens) && completionTokens >= 0 ? completionTokens : 0
+      };
+      const importedCap = data.spendingCap === undefined ? App.spendingCap : Number(data.spendingCap);
+      if (!Number.isFinite(importedCap) || importedCap < 0) throw new Error('Import contains an invalid spending cap.');
+      const importedRotation = Number(data.rotationOffset ?? 0);
+      const importedSummaryCount = Number(data.summarizedMessageCount ?? 0);
+
+      if (normalizedSeats) App.seats = normalizedSeats;
+      App.messages = normalizedMessages;
+      App.runningBrief = typeof data.runningBrief === 'string' ? data.runningBrief.slice(0, 4000) : '';
+      App.summarizedMessageCount = Math.min(App.messages.length, Math.max(0, Number.isFinite(importedSummaryCount) ? importedSummaryCount : 0));
+      App.sessionCost = importedCost;
+      // Imported cost totals are user-editable and cannot be independently verified.
+      App.sessionCostKnown = false;
+      App.sessionTokens = sessionTokens;
       if (data.turnMode) App.turnMode = data.turnMode;
-      if (data.rounds) App.rounds = clamp(Number(data.rounds)||1,1,5);
-      App.rotationOffset = Number(data.rotationOffset) || 0;
-      if (data.spendingCap !== undefined) App.spendingCap = Math.max(0, Number(data.spendingCap)||0);
+      if (data.rounds !== undefined) App.rounds = clamp(Number(data.rounds) || 1, 1, 5);
+      App.rotationOffset = Number.isFinite(importedRotation) && importedRotation >= 0 ? importedRotation : 0;
+      App.spendingCap = importedCap;
       if (data.capEnabled !== undefined) App.capEnabled = !!data.capEnabled;
-      App.sessionName = data.sessionName || 'Imported session';
+      App.contextTruncated = !!data.contextTruncated;
+      App.sessionName = String(data.sessionName || 'Imported session').slice(0, 100);
       App.currentSessionId = App.currentSessionId || uid();
-      App.capApprovedOverage = false;
       $('turnMode').value = App.turnMode;
       $('rounds').value = String(App.rounds);
       $('spendingCap').value = String(App.spendingCap);
@@ -1821,8 +2216,7 @@ function importThreadJSON(file) {
       renderThread();
       updateStats();
       updateControls();
-      persistCurrentSession();
-      setStatus('Import complete. Thread and seats restored.');
+      if (persistCurrentSession()) setStatus('Import complete. Thread and seats restored.');
     } catch (err) {
       setStatus('Import failed: ' + err.message, 'err');
     }
@@ -1831,18 +2225,18 @@ function importThreadJSON(file) {
 }
 
 function clearThread() {
-  if (App.running) stopCurrent();
+  if (!sessionChangesAllowed()) return;
   App.messages = [];
   App.runningBrief = '';
   App.summarizedMessageCount = 0;
   App.sessionCost = 0;
+  App.sessionCostKnown = true;
   App.sessionTokens = { prompt: 0, completion: 0 };
-  App.capApprovedOverage = false;
+  App.contextTruncated = false;
   App.rotationOffset = 0;
   renderThread();
   updateStats();
-  persistCurrentSession();
-  setStatus('Thread cleared.');
+  if (persistCurrentSession()) setStatus('Thread cleared.');
 }
 
 /* ---- Presets ---- */
@@ -1853,17 +2247,19 @@ function refreshPresetSelect() {
 }
 
 function savePreset() {
+  if (!sessionChangesAllowed()) return;
   const name = $('presetName').value.trim();
   if (!name) { setStatus('Enter a preset name before saving.'); return; }
   const store = seatPresetsStore();
   store[name] = exportSeatLineup();
-  saveSeatPresetsStore(store);
+  if (!saveSeatPresetsStore(store)) { showStorageWriteFailure(); return; }
   refreshPresetSelect();
   $('presetSelect').value = name;
   setStatus(`Preset "${name}" saved.`);
 }
 
 function loadPreset() {
+  if (!sessionChangesAllowed()) return;
   const name = $('presetSelect').value;
   if (!name) { setStatus('No preset selected.'); return; }
   const store = seatPresetsStore();
@@ -1879,20 +2275,30 @@ function exportPresetsJSON() {
 }
 
 function importPresetsJSON(file) {
+  if (!sessionChangesAllowed()) return;
+  if (!file || file.size > 2 * 1024 * 1024) {
+    setStatus('Preset file is missing or exceeds the 2 MB limit.', 'err');
+    return;
+  }
   const reader = new FileReader();
+  reader.onerror = () => setStatus('Could not read the selected preset file.', 'err');
   reader.onload = () => {
     try {
+      if (!sessionChangesAllowed()) return;
       const data = JSON.parse(String(reader.result || ''));
-      const incoming = data.presets && typeof data.presets === 'object' ? data.presets : data;
+      const incoming = data?.presets && typeof data.presets === 'object' ? data.presets : data;
       if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) throw new Error('Invalid presets file.');
       const store = seatPresetsStore();
       for (const [name, lineup] of Object.entries(incoming)) {
-        if (Array.isArray(lineup)) store[name] = lineup;
+        if (Array.isArray(lineup)) {
+          const normalized = normalizeSeatLineup(lineup);
+          store[String(name).slice(0, 100)] = normalized.map(({ id, ...seat }) => seat);
+        }
       }
-      saveSeatPresetsStore(store);
+      if (!saveSeatPresetsStore(store)) { showStorageWriteFailure(); return; }
       refreshPresetSelect();
       setStatus('Presets imported.');
-    } catch (err) { setStatus('Preset import failed: ' + err.message); }
+    } catch (err) { setStatus('Preset import failed: ' + err.message, 'err'); }
   };
   reader.readAsText(file);
 }
@@ -1911,11 +2317,11 @@ function bindUI() {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendUserMessage(); }
   });
   $('btnAnotherRound').addEventListener('click', () => {
-    if (App.running) return;
+    if (App.runInFlight || App.running) return;
     if (!getThreadForDisplay().some(m => m.role === 'user')) { setStatus('Send an idea first.'); return; }
     runRounds({ count: 1 });
   });
-  $('btnCallModerator').addEventListener('click', () => { if (!App.running) runRounds({ moderatorOnly: true }); });
+  $('btnCallModerator').addEventListener('click', () => { if (!App.runInFlight && !App.running) runRounds({ moderatorOnly: true }); });
   $('btnStop').addEventListener('click', stopCurrent);
   $('btnSkip').addEventListener('click', skipCurrentSeat);
   $('btnRegen').addEventListener('click', regenerateLast);
@@ -1927,12 +2333,21 @@ function bindUI() {
   $('btnClearThread').addEventListener('click', clearThread);
 
   $('btnNewSession').addEventListener('click', newSession);
-  $('btnSaveSession').addEventListener('click', () => { persistCurrentSession(); setStatus('Session saved.'); });
+  $('btnSaveSession').addEventListener('click', () => { if (persistCurrentSession()) setStatus('Session saved.'); });
   $('btnDeleteSession').addEventListener('click', () => { if (confirm('Delete the current session?')) deleteCurrentSession(); });
   $('sessionSelect').addEventListener('change', (e) => { if (e.target.value) loadSession(e.target.value); });
 
-  $('btnAddSeat').addEventListener('click', () => { App.seats.push(makeSeat()); renderSeats(); persistSettings(); });
-  $('btnResetSeats').addEventListener('click', () => { if (confirm('Reset seats to the 4 default presets?')) { App.seats = cloneSeats(DEFAULT_SEATS); renderSeats(); persistSettings(); } });
+  $('btnAddSeat').addEventListener('click', () => {
+    if (!sessionChangesAllowed()) return;
+    if (App.seats.length >= MAX_SEATS) { setStatus(`A lineup can have at most ${MAX_SEATS} seats.`); return; }
+    App.seats.push(makeSeat());
+    renderSeats();
+    persistSettings();
+  });
+  $('btnResetSeats').addEventListener('click', () => {
+    if (!sessionChangesAllowed()) return;
+    if (confirm('Reset seats to the 4 default presets?')) { App.seats = cloneSeats(DEFAULT_SEATS); renderSeats(); persistSettings(); }
+  });
 
   $('btnSavePreset').addEventListener('click', savePreset);
   $('btnLoadPreset').addEventListener('click', loadPreset);
@@ -1942,14 +2357,19 @@ function bindUI() {
 }
 
 async function sendUserMessage() {
-  if (App.running) return;
+  if (App.runInFlight || App.running) return;
   const text = $('userInput').value.trim();
   if (!text) return;
-  if (!activeSeats().length) { setStatus('Enable at least one seat first.'); return; }
+  if (!canStartDiscussion(text)) {
+    const hasModerator = activeSeats().some(isModeratorSeat);
+    setStatus(hasModerator
+      ? 'No discussion seats are enabled. Mention @Moderator in Mention mode or use Call Moderator.'
+      : 'Enable at least one discussion seat first.');
+    return;
+  }
   $('userInput').value = '';
   App.messages.push({ id: uid(), role: 'user', speaker: 'You', content: text, ts: Date.now() });
   App.lastUserMessageId = App.messages[App.messages.length - 1].id;
-  App.capApprovedOverage = false; // reset per new user action? keep cap strictness per session but ask again on new action
   renderThread();
   scrollThreadToBottom();
   persistCurrentSession();
@@ -1963,7 +2383,8 @@ function loadSettings() {
     ProviderState.rememberKeys = !!s.rememberKeys;
     ProviderState.ollamaBaseUrl = s.ollamaBaseUrl || ProviderState.ollamaBaseUrl;
     ProviderState.openRouterFreeOnly = !!s.openRouterFreeOnly;
-    App.spendingCap = Number(s.spendingCap ?? App.spendingCap);
+    const storedCap = Number(s.spendingCap ?? App.spendingCap);
+    App.spendingCap = Number.isFinite(storedCap) && storedCap >= 0 ? storedCap : 1;
     App.capEnabled = s.capEnabled !== false;
     App.turnMode = s.turnMode || App.turnMode;
     App.rounds = clamp(Number(s.rounds)||1,1,5);
